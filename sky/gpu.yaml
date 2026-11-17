@@ -1,0 +1,70 @@
+# GPU server: vLLM on one L4 plus GPU telemetry for the machine's lifetime.
+# sky launch -c stt-gpu sky/gpu.yaml --secret VLLM_API_KEY --secret HF_TOKEN
+name: stt-gpu
+
+resources:
+  infra: gcp
+  accelerators: L4:1
+  disk_size: 100
+  # Idle = no running SkyPilot job. The server runs detached, so the timer starts once this task
+  # finishes. Keep it longer than a session; relaunch the task to reset it.
+  autostop:
+    idle_minutes: 240
+
+secrets:
+  VLLM_API_KEY: null
+  HF_TOKEN: null
+
+envs:
+  IMAGE: vllm/vllm-openai@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+
+# The base image lacks vllm[audio]; these pins are what `pip install vllm[audio]==0.26.0` resolves in it.
+setup: |
+  docker pull "$IMAGE"
+  docker build -t stt-vllm:local - <<EOF
+  FROM $IMAGE
+  RUN python3 -m pip install --no-cache-dir av==19.0.2 scipy==1.18.1 soundfile==0.14.0 soxr==1.1.0
+  EOF
+
+run: |
+  set -euo pipefail
+  mkdir -p ~/telemetry
+  docker rm -f stt-telemetry stt-vllm 2>/dev/null || true
+
+  # Appends to ~/telemetry/gpu.csv across relaunches; collection slices it by run window.
+  # A file with an older header is moved aside so each file has one column layout.
+  # clock_event_reasons is an nvidia-smi bitmask: 0x4 = power cap, 0x20/0x40 = thermal, 0x1 = idle.
+  # cpu_pct is whole-host CPU busy % (the container's /proc/stat is the host's).
+  docker run -d --name stt-telemetry --restart unless-stopped --gpus all \
+    -v ~/telemetry:/telemetry --entrypoint bash "$IMAGE" -c '
+      f=/telemetry/gpu.csv
+      h=utc,index,memory_used_mib,memory_total_mib,utilization_gpu_pct,power_w,sm_clock_mhz,clock_event_reasons,cpu_pct
+      if [ "$(head -1 $f 2>/dev/null)" != "$h" ]; then
+        [ -s $f ] && mv $f $f.old-$(date -u +%s)
+        echo $h > $f
+      fi
+      read -r _ u n s i w q sq st _ < /proc/stat; pb=$((u+n+s+q+sq+st)); pt=$((pb+i+w))
+      while true; do
+        sleep 1
+        read -r _ u n s i w q sq st _ < /proc/stat; b=$((u+n+s+q+sq+st)); tot=$((b+i+w))
+        d=$((tot-pt)); cpu=0; [ $d -gt 0 ] && cpu=$(( (b-pb)*100/d )); pb=$b; pt=$tot
+        t=$(date -u +%FT%T.%3NZ)
+        nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu,power.draw,clocks.sm,clocks_event_reasons.active \
+          --format=csv,noheader,nounits | sed "s/ //g; s/^/$t,/; s/\$/,$cpu/" >> $f
+      done'
+
+  # Port 8000 is reachable on the internal network only: no `ports:` above, so no public rule.
+  docker run -d --name stt-vllm --gpus all --shm-size 2g -p 8000:8000 \
+    -v stt-model-cache:/root/.cache/huggingface \
+    -e VLLM_API_KEY -e HF_TOKEN -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=75 \
+    stt-vllm:local \
+    openai/whisper-large-v3-turbo \
+    --revision 41f01f3fe87f28c78e2fbf8b568835947dd65ed9 \
+    --max-num-seqs 16
+
+  until curl -sf localhost:8000/health; do
+    [ "$(docker inspect -f '{{.State.Running}}' stt-vllm)" = true ] || { docker logs stt-vllm; exit 1; }
+    sleep 5
+  done
+  echo "ready on $(hostname -I | cut -d' ' -f1):8000"

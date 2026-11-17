@@ -1,0 +1,15 @@
+# Optional CPU load VM for performance runs. Must share the GPU VM's zone:
+# sky launch -c stt-load sky/load.yaml --infra gcp/REGION/ZONE
+name: stt-load
+
+resources:
+  infra: gcp
+  cpus: 4+
+  autostop:
+    idle_minutes: 240
+
+workdir: .
+
+setup: |
+  command -v ~/.local/bin/uv || curl -LsSf https://astral.sh/uv/install.sh | sh
+  ~/.local/bin/uv sync --locked
